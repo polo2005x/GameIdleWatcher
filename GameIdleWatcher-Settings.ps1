@@ -34,11 +34,34 @@ function Normalize-ProcessName([string]$name) {
 
 # ---------- status ----------
 
-function Get-IdleDisabled {
+function Get-PowerValue([string]$setting) {
     # Last two hex values in the output are the AC and DC indices (works on any Windows language).
-    $hex = [regex]::Matches((powercfg /qh scheme_current sub_processor IDLEDISABLE | Out-String), '0x[0-9a-fA-F]+')
-    if ($hex.Count -lt 2) { return $false }
-    [Convert]::ToInt32($hex[$hex.Count - 2].Value, 16) -eq 1
+    $hex = [regex]::Matches((powercfg /qh scheme_current sub_processor $setting | Out-String), '0x[0-9a-fA-F]+')
+    if ($hex.Count -lt 2) { return -1 }
+    [Convert]::ToInt32($hex[$hex.Count - 2].Value, 16)
+}
+
+# ---------- settings.txt (mode) ----------
+
+$SettingsFile = Join-Path $PSScriptRoot 'settings.txt'
+$Modes = @(
+    [pscustomobject]@{ Key = 'full';  Text = 'Full - cores never sleep (strongest)' }
+    [pscustomobject]@{ Key = 'light'; Text = 'Light - shallow sleep only (less heat/power)' }
+)
+
+function Read-Mode {
+    if (Test-Path -LiteralPath $SettingsFile) {
+        $line = Get-Content -LiteralPath $SettingsFile | Where-Object { $_ -match '^\s*mode\s*=' } | Select-Object -First 1
+        if ($line -match '=\s*light\s*$') { return 'light' }
+    }
+    'full'
+}
+
+function Save-Mode([string]$mode) {
+    $lines = if (Test-Path -LiteralPath $SettingsFile) { @(Get-Content -LiteralPath $SettingsFile) } else { @() }
+    if ($lines -match '^\s*mode\s*=') { $lines = $lines -replace '^\s*mode\s*=.*$', "mode=$mode" }
+    else { $lines += "mode=$mode" }
+    Set-Content -LiteralPath $SettingsFile -Value $lines -Encoding UTF8
 }
 
 function Update-Status {
@@ -60,9 +83,12 @@ function Update-Status {
 
     $games = @(Read-Games)
     $open = if ($games) { Get-Process -Name $games.Name -ErrorAction SilentlyContinue | Select-Object -First 1 }
-    if (Get-IdleDisabled) {
-        $label = if ($open) { ($games | Where-Object Name -eq $open.Name | Select-Object -First 1).Label } else { 'a game' }
-        $idleLabel.Text = "CPU idle: DISABLED ($label is running)"
+    $label = if ($open) { ($games | Where-Object Name -eq $open.Name | Select-Object -First 1).Label } else { 'a game' }
+    if ((Get-PowerValue IDLEDISABLE) -eq 1) {
+        $idleLabel.Text = "CPU idle: DISABLED - full mode ($label is running)"
+        $idleLabel.ForeColor = [System.Drawing.Color]::ForestGreen
+    } elseif ((Get-PowerValue IDLEPROMOTE) -eq 100 -and (Get-PowerValue IDLEDEMOTE) -eq 100) {
+        $idleLabel.Text = "CPU idle: SHALLOW ONLY - light mode ($label is running)"
         $idleLabel.ForeColor = [System.Drawing.Color]::ForestGreen
     } else {
         $idleLabel.Text = 'CPU idle: normal (no listed game running)'
@@ -201,7 +227,7 @@ function Show-ProcessPicker {
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Game Idle Watcher'
-$form.Size = New-Object System.Drawing.Size(560, 420)
+$form.Size = New-Object System.Drawing.Size(560, 450)
 $form.MinimumSize = New-Object System.Drawing.Size(480, 340)
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
@@ -222,7 +248,26 @@ $idleLabel = New-Object System.Windows.Forms.Label
 $idleLabel.Dock = 'Top'
 $idleLabel.Height = 22
 
-$statusPanel.Controls.AddRange(@($idleLabel, $watcherLabel))
+$modeRow = New-Object System.Windows.Forms.FlowLayoutPanel
+$modeRow.Dock = 'Top'
+$modeRow.Height = 32
+$modeRow.WrapContents = $false
+
+$modeLabel = New-Object System.Windows.Forms.Label
+$modeLabel.Text = 'Mode while a game runs:'
+$modeLabel.AutoSize = $true
+$modeLabel.Margin = New-Object System.Windows.Forms.Padding(0, 7, 6, 0)
+
+$modeBox = New-Object System.Windows.Forms.ComboBox
+$modeBox.DropDownStyle = 'DropDownList'
+$modeBox.Width = 300
+$modeBox.DisplayMember = 'Text'
+foreach ($m in $Modes) { [void]$modeBox.Items.Add($m) }
+
+$modeRow.Controls.AddRange(@($modeLabel, $modeBox))
+$statusPanel.Height = 90
+# Docked Top in reverse: watcher line, idle line, then mode row.
+$statusPanel.Controls.AddRange(@($modeRow, $idleLabel, $watcherLabel))
 
 # Game list (fill)
 $list = New-Object System.Windows.Forms.ListView
@@ -285,6 +330,12 @@ $form.Controls.AddRange(@($list, $side, $bottomPanel, $statusPanel))
 # ---------- events ----------
 
 $list.Add_SelectedIndexChanged({ $removeButton.Enabled = $list.SelectedItems.Count -gt 0 })
+
+$current = Read-Mode
+$modeBox.SelectedItem = $Modes | Where-Object Key -eq $current
+$modeBox.Add_SelectedIndexChanged({
+    if ($modeBox.SelectedItem) { Save-Mode $modeBox.SelectedItem.Key }
+})
 
 $addRunningButton.Add_Click({ Show-ProcessPicker })
 
