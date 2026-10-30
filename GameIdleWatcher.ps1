@@ -3,10 +3,12 @@
 # games.txt and settings.txt are re-read every poll, so edits (by hand or from the settings window)
 # apply without a restart.
 #
-# Modes (settings.txt: mode=full or mode=light):
+# Modes:
 #   full  - Processor idle disable = on. Cores never sleep (like Global C-State Control = Disabled).
 #   light - Idle promote/demote thresholds = 100%. Cores still use the shallow C1 state but never
 #           go into the deeper, slower-to-wake states. Less heat and power than full.
+# Each game in games.txt can set its own mode ("Name | light"); games without one use the default
+# from settings.txt (mode=full or mode=light). If several games run at once, full wins over light.
 
 $GamesFile    = Join-Path $PSScriptRoot 'games.txt'
 $SettingsFile = Join-Path $PSScriptRoot 'settings.txt'
@@ -24,12 +26,18 @@ function Write-Log([string]$message) {
     } catch { }
 }
 
-# One process name per line (the .exe name without ".exe"); anything after # is a label/comment.
-function Get-GameNames {
+# One game per line: "ProcessName", optionally "ProcessName | full" or "ProcessName | light".
+# The process name is the .exe name without ".exe"; anything after # is a label/comment.
+function Get-Games {
     if (-not (Test-Path -LiteralPath $GamesFile)) { return @() }
-    Get-Content -LiteralPath $GamesFile |
-        ForEach-Object { ($_ -split '#', 2)[0].Trim() } |
-        Where-Object { $_ }
+    foreach ($line in Get-Content -LiteralPath $GamesFile) {
+        $fields = ($line -split '#', 2)[0] -split '\|', 2
+        $name = $fields[0].Trim()
+        if (-not $name) { continue }
+        $mode = if ($fields.Count -gt 1) { $fields[1].Trim().ToLower() } else { '' }
+        if ($mode -notin 'full', 'light') { $mode = 'default' }
+        [pscustomobject]@{ Name = $name; Mode = $mode }
+    }
 }
 
 function Get-Mode {
@@ -73,20 +81,28 @@ if ($script:OrigPromote -eq 100 -and $script:OrigDemote -eq 100) {
 Restore-Idle
 $activeMode = $null   # $null = not active, otherwise the mode currently applied
 $prevRunning = @()
-$prevMode = $null
-Write-Log ("Watcher started. Mode: {0}. Games: {1}. Normal thresholds: promote {2} / demote {3}." -f
-    (Get-Mode), ((@(Get-GameNames)) -join ', '), $script:OrigPromote, $script:OrigDemote)
+$prevDefault = $null
+$startGames = @(Get-Games) | ForEach-Object { if ($_.Mode -eq 'default') { $_.Name } else { "$($_.Name) ($($_.Mode))" } }
+Write-Log ("Watcher started. Default mode: {0}. Games: {1}. Normal thresholds: promote {2} / demote {3}." -f
+    (Get-Mode), ($startGames -join ', '), $script:OrigPromote, $script:OrigDemote)
 
 try {
     while ($true) {
-        $names = @(Get-GameNames)
+        $games = @(Get-Games)
+        $defaultMode = Get-Mode
         # Match by name only: Vanguard hides League's path from normal processes.
-        $runningNames = if ($names) { @(Get-Process -Name $names -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique | Sort-Object) } else { @() }
+        $runningNames = if ($games) { @(Get-Process -Name $games.Name -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique | Sort-Object) } else { @() }
         $running = $runningNames.Count -gt 0
-        $mode = Get-Mode
 
-        if ($prevMode -and $mode -ne $prevMode) { Write-Log "Mode changed: $prevMode -> $mode" }
-        $prevMode = $mode
+        # Effective mode: each running game's own mode (or the default); full wins over light.
+        $wanted = foreach ($n in $runningNames) {
+            $g = $games | Where-Object Name -eq $n | Select-Object -First 1
+            if ($g.Mode -eq 'default') { $defaultMode } else { $g.Mode }
+        }
+        $mode = if (@($wanted) -contains 'full') { 'full' } else { 'light' }
+
+        if ($prevDefault -and $defaultMode -ne $prevDefault) { Write-Log "Default mode changed: $prevDefault -> $defaultMode" }
+        $prevDefault = $defaultMode
         foreach ($n in $runningNames) { if ($prevRunning -notcontains $n) { Write-Log "Game started: $n" } }
         foreach ($n in $prevRunning)  { if ($runningNames -notcontains $n) { Write-Log "Game closed: $n" } }
         $prevRunning = $runningNames
@@ -95,7 +111,7 @@ try {
             if ($activeMode) { Restore-Idle }   # mode switched while a game is running
             Enable-Mode $mode
             $activeMode = $mode
-            Write-Log ("ON ({0} mode): {1}" -f $mode,
+            Write-Log ("ON ({0} mode) for {1}: {2}" -f $mode, ($runningNames -join ', '),
                 $(if ($mode -eq 'light') { 'promote/demote thresholds set to 100%' } else { 'processor idle disabled' }))
         } elseif (-not $running -and $activeMode) {
             Restore-Idle

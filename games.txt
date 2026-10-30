@@ -1,4 +1,5 @@
 # Games that disable CPU idle states while running.
 # One process name per line (the .exe name without ".exe"). Text after # is a label.
+# Optional per-game mode: "Name | full" or "Name | light". Without it the default mode is used.
 League of Legends  # League of Legends (in a match only)
 Warframe.x64  # Warframe
