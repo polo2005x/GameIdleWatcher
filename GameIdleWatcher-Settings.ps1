@@ -89,11 +89,11 @@ function Save-Mode([string]$mode) {
 function Update-Status {
     Sync-Watcher
     $games = @(Read-Games)
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $task = Get-TaskInfo $TaskName
     if (-not $games) {
         $watcherLabel.Text = 'Watcher: off (add a game to turn it on)'
         $watcherLabel.ForeColor = [System.Drawing.SystemColors]::GrayText
-    } elseif ($task -and $task.State -eq 'Running') {
+    } elseif ($task -and $task.Running) {
         $watcherLabel.Text = 'Watcher: running (starts automatically at logon)'
         $watcherLabel.ForeColor = [System.Drawing.Color]::ForestGreen
     } else {
@@ -239,6 +239,21 @@ function Add-Game([string]$name, [string]$label) {
 $WatcherScript = Join-Path $PSScriptRoot 'GameIdleWatcher.ps1'
 $OldTaskNames  = @('League Idle Watcher')   # names used by earlier versions
 
+# Read task state through the Task Scheduler COM API: ~5 ms, versus ~450 ms for Get-ScheduledTask,
+# which froze the window on every status refresh.
+$script:TaskFolder = $null
+try { $svc = New-Object -ComObject Schedule.Service; $svc.Connect(); $script:TaskFolder = $svc.GetFolder('\') } catch { }
+
+function Get-TaskInfo([string]$name) {
+    if ($script:TaskFolder) {
+        try { $t = $script:TaskFolder.GetTask($name) } catch { return $null }
+        return [pscustomobject]@{ Running = $t.State -eq 4; Arguments = "$($t.Definition.Actions.Item(1).Arguments)" }
+    }
+    $t = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    if (-not $t) { return $null }
+    [pscustomobject]@{ Running = "$($t.State)" -eq 'Running'; Arguments = "$($t.Actions[0].Arguments)" }
+}
+
 function Stop-WatcherProcesses {
     # Stopping the task only ends the conhost wrapper, so also end the PowerShell process inside it.
     Get-CimInstance Win32_Process |
@@ -287,15 +302,14 @@ function Remove-Watcher {
 $script:LastRepair = [datetime]::MinValue
 function Sync-Watcher([switch]$Force) {
     $hasGames = @(Read-Games).Count -gt 0
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    $old  = $OldTaskNames | Where-Object { Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue }
+    $task = Get-TaskInfo $TaskName
+    $old  = $OldTaskNames | Where-Object { Get-TaskInfo $_ }
 
     if (-not $hasGames) {
         if ($task -or $old) { Remove-Watcher }
         return
     }
-    $healthy = $task -and -not $old -and $task.State -eq 'Running' -and
-               "$($task.Actions[0].Arguments)" -like "*$WatcherScript*"
+    $healthy = $task -and -not $old -and $task.Running -and $task.Arguments -like "*$WatcherScript*"
     # Don't retry a failing install every tick.
     if (-not $healthy -and ($Force -or ((Get-Date) - $script:LastRepair).TotalSeconds -gt 30)) {
         $script:LastRepair = Get-Date
