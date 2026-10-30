@@ -18,12 +18,22 @@ It runs hidden in the background and starts automatically at every logon. If you
 Open `GameIdleWatcher-Settings.bat` to:
 
 - See whether the watcher is running and whether CPU idle is currently disabled.
+- Pick the **mode** used while a game runs (see below).
 - **Add running program...**: start the game, then pick it from the list of open programs.
 - **Add by process name...**: type the `.exe` name (Task Manager → Details).
 - **Remove** a game.
 - **Install / Reinstall / Uninstall** the watcher.
 
 Changes to the game list apply within 5 seconds, no reinstall needed.
+
+## Modes
+
+| Mode | What it does | Trade-off |
+|---|---|---|
+| **Full** (default) | Processor idle disable = on. Cores never sleep, same effect as Global C-State Control = Disabled in the BIOS. | Strongest fix, most heat and power while gaming. |
+| **Light** | Idle promote/demote thresholds = 100%. Cores still use the shallow C1 state (wakes almost instantly) but never enter the deeper, slow-to-wake states. | Less heat and power. Try it; if stutters come back, switch to Full. |
+
+The mode can be changed while a game is running and applies within 5 seconds. Your choice is saved in `settings.txt` (`mode=full` or `mode=light`).
 
 ## Games list
 
@@ -40,7 +50,7 @@ Click **Uninstall** in the settings window, or run `Uninstall-GameIdleWatcher.ba
 
 ## How it works
 
-Every 5 seconds `GameIdleWatcher.ps1` re-reads `games.txt` and checks whether a listed game is running. If one is, it sets the Windows power setting **Processor idle disable** (`IDLEDISABLE`) to on for the active power plan; when the game closes, it sets it back off. It also resets the setting to off every time it starts, so it can't get stuck on.
+Every 5 seconds `GameIdleWatcher.ps1` re-reads `games.txt` and checks whether a listed game is running. If one is, it changes the active power plan: **Processor idle disable** (`IDLEDISABLE`) on in Full mode, or **Processor idle promote/demote threshold** (`IDLEPROMOTE`/`IDLEDEMOTE`) at 100% in Light mode. Idle stays changed until the last listed game closes, then it's restored. It also restores normal idle every time it starts, so it can't get stuck on.
 
 Notes:
 

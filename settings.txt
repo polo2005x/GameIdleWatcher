@@ -1,4 +1,0 @@
-﻿# Game Idle Watcher settings.
-# mode=full  : cores never sleep while a game runs (strongest fix).
-# mode=light : cores only use the shallow C1 sleep state (less heat/power, try this first if you like).
-mode=light
