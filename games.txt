@@ -1,0 +1,4 @@
+# Games that disable CPU idle states while running.
+# One process name per line (the .exe name without ".exe"). Text after # is a label.
+League of Legends  # League of Legends (in a match only)
+Warframe.x64  # Warframe

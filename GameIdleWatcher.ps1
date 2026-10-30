@@ -1,12 +1,17 @@
-# Disables CPU idle states (like turning off C-States) only while one of the games below is running.
+# Disables CPU idle states (like turning off C-States) only while a game from games.txt is running.
 # Restores normal idle behavior when the game closes.
+# games.txt is re-read every poll, so edits (by hand or from the settings window) apply without a restart.
 
-# Process names (the .exe name without ".exe"). Add more games here.
-$GameNames = @(
-    'League of Legends'   # League of Legends\Game\League of Legends.exe (in a match only)
-    'Warframe.x64'        # Warframe\Warframe.x64.exe
-)
+$GamesFile = Join-Path $PSScriptRoot 'games.txt'
 $PollSeconds = 5
+
+# One process name per line (the .exe name without ".exe"); anything after # is a label/comment.
+function Get-GameNames {
+    if (-not (Test-Path -LiteralPath $GamesFile)) { return @() }
+    Get-Content -LiteralPath $GamesFile |
+        ForEach-Object { ($_ -split '#', 2)[0].Trim() } |
+        Where-Object { $_ }
+}
 
 function Set-IdleDisable([int]$value) {
     powercfg /setacvalueindex scheme_current sub_processor IDLEDISABLE $value
@@ -19,8 +24,9 @@ $active = $false
 
 try {
     while ($true) {
-        # Match by name only: Vanguard hides the game's path from normal processes.
-        $running = [bool](Get-Process -Name $GameNames -ErrorAction SilentlyContinue)
+        $names = @(Get-GameNames)
+        # Match by name only: Vanguard hides League's path from normal processes.
+        $running = $names.Count -gt 0 -and [bool](Get-Process -Name $names -ErrorAction SilentlyContinue)
 
         if ($running -and -not $active) {
             Set-IdleDisable 1

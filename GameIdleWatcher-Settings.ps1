@@ -1,0 +1,324 @@
+# Settings window for Game Idle Watcher: add/remove games, see status, install/uninstall.
+
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing, Microsoft.VisualBasic
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$GamesFile = Join-Path $PSScriptRoot 'games.txt'
+$TaskName  = 'Game Idle Watcher'
+$Header = @(
+    '# Games that disable CPU idle states while running.'
+    '# One process name per line (the .exe name without ".exe"). Text after # is a label.'
+)
+
+# ---------- games.txt ----------
+
+function Read-Games {
+    if (-not (Test-Path -LiteralPath $GamesFile)) { return @() }
+    foreach ($line in Get-Content -LiteralPath $GamesFile) {
+        $parts = $line -split '#', 2
+        $name = $parts[0].Trim()
+        if (-not $name) { continue }
+        $label = if ($parts.Count -gt 1 -and $parts[1].Trim()) { $parts[1].Trim() } else { $name }
+        [pscustomobject]@{ Name = $name; Label = $label }
+    }
+}
+
+function Save-Games($games) {
+    $lines = $Header + @($games | ForEach-Object { "$($_.Name)  # $($_.Label)" })
+    Set-Content -LiteralPath $GamesFile -Value $lines -Encoding UTF8
+}
+
+function Normalize-ProcessName([string]$name) {
+    ($name.Trim() -replace '\.exe$', '').Trim()
+}
+
+# ---------- status ----------
+
+function Get-IdleDisabled {
+    # Last two hex values in the output are the AC and DC indices (works on any Windows language).
+    $hex = [regex]::Matches((powercfg /qh scheme_current sub_processor IDLEDISABLE | Out-String), '0x[0-9a-fA-F]+')
+    if ($hex.Count -lt 2) { return $false }
+    [Convert]::ToInt32($hex[$hex.Count - 2].Value, 16) -eq 1
+}
+
+function Update-Status {
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task) {
+        $watcherLabel.Text = 'Watcher: not installed'
+        $watcherLabel.ForeColor = [System.Drawing.Color]::Firebrick
+        $installButton.Text = 'Install'
+    } elseif ($task.State -eq 'Running') {
+        $watcherLabel.Text = 'Watcher: running (starts automatically at logon)'
+        $watcherLabel.ForeColor = [System.Drawing.Color]::ForestGreen
+        $installButton.Text = 'Reinstall'
+    } else {
+        $watcherLabel.Text = "Watcher: installed but $($task.State.ToString().ToLower()) - click Reinstall"
+        $watcherLabel.ForeColor = [System.Drawing.Color]::DarkOrange
+        $installButton.Text = 'Reinstall'
+    }
+    $uninstallButton.Enabled = [bool]$task
+
+    $games = @(Read-Games)
+    $open = if ($games) { Get-Process -Name $games.Name -ErrorAction SilentlyContinue | Select-Object -First 1 }
+    if (Get-IdleDisabled) {
+        $label = if ($open) { ($games | Where-Object Name -eq $open.Name | Select-Object -First 1).Label } else { 'a game' }
+        $idleLabel.Text = "CPU idle: DISABLED ($label is running)"
+        $idleLabel.ForeColor = [System.Drawing.Color]::ForestGreen
+    } else {
+        $idleLabel.Text = 'CPU idle: normal (no listed game running)'
+        $idleLabel.ForeColor = [System.Drawing.SystemColors]::ControlText
+    }
+}
+
+function Refresh-List {
+    $list.BeginUpdate()
+    $list.Items.Clear()
+    foreach ($g in Read-Games) {
+        $item = New-Object System.Windows.Forms.ListViewItem($g.Label)
+        [void]$item.SubItems.Add($g.Name)
+        $item.Tag = $g
+        [void]$list.Items.Add($item)
+    }
+    $list.EndUpdate()
+    $list.Columns[1].Width = -2
+    $removeButton.Enabled = $false
+}
+
+function Add-Game([string]$name, [string]$label) {
+    $name = Normalize-ProcessName $name
+    if (-not $name) { return }
+    $games = @(Read-Games)
+    if ($games.Name -contains $name) {
+        [System.Windows.Forms.MessageBox]::Show("$name is already in the list.", 'Game Idle Watcher') | Out-Null
+        return
+    }
+    if (-not $label) { $label = $name }
+    Save-Games ($games + [pscustomobject]@{ Name = $name; Label = $label.Trim() })
+    Refresh-List
+    Update-Status
+}
+
+# ---------- install / uninstall (reuse the .bat files) ----------
+
+function Invoke-Bat([string]$file) {
+    $path = Join-Path $PSScriptRoot $file
+    if (-not (Test-Path -LiteralPath $path)) {
+        [System.Windows.Forms.MessageBox]::Show("Could not find $file next to this script.", 'Game Idle Watcher') | Out-Null
+        return
+    }
+    $form.UseWaitCursor = $true
+    Start-Process cmd.exe -ArgumentList "/c `"`"$path`" < nul`"" -WindowStyle Hidden -Wait
+    $form.UseWaitCursor = $false
+    Update-Status
+}
+
+# ---------- "add running program" picker ----------
+
+function Show-ProcessPicker {
+    $existing = @(Read-Games).Name
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Add a running program'
+    $dlg.Size = New-Object System.Drawing.Size(560, 460)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.MinimizeBox = $false
+    $dlg.Font = $form.Font
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = 'Start the game first, then pick it here. Double-click to add.'
+    $hint.Dock = 'Top'
+    $hint.Height = 28
+    $hint.Padding = New-Object System.Windows.Forms.Padding(8, 8, 8, 0)
+
+    $procList = New-Object System.Windows.Forms.ListView
+    $procList.View = 'Details'
+    $procList.FullRowSelect = $true
+    $procList.MultiSelect = $false
+    $procList.HideSelection = $false
+    $procList.Dock = 'Fill'
+    [void]$procList.Columns.Add('Program', 200)
+    [void]$procList.Columns.Add('Process name', 160)
+    [void]$procList.Columns.Add('Window title', 160)
+
+    $bottom = New-Object System.Windows.Forms.FlowLayoutPanel
+    $bottom.Dock = 'Bottom'
+    $bottom.Height = 44
+    $bottom.FlowDirection = 'RightToLeft'
+    $bottom.Padding = New-Object System.Windows.Forms.Padding(6)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'Add'
+    $ok.AutoSize = $true
+    $ok.Enabled = $false
+    $ok.DialogResult = 'OK'
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.AutoSize = $true
+    $cancel.DialogResult = 'Cancel'
+
+    $showAll = New-Object System.Windows.Forms.CheckBox
+    $showAll.Text = 'Show background processes'
+    $showAll.AutoSize = $true
+    $showAll.Margin = New-Object System.Windows.Forms.Padding(3, 7, 12, 3)
+
+    $bottom.Controls.AddRange(@($cancel, $ok, $showAll))
+    $dlg.Controls.AddRange(@($procList, $hint, $bottom))
+    $dlg.AcceptButton = $ok
+    $dlg.CancelButton = $cancel
+
+    $fill = {
+        $procList.BeginUpdate()
+        $procList.Items.Clear()
+        $procs = Get-Process | Where-Object { $_.Id -ne $PID -and $existing -notcontains $_.Name }
+        if (-not $showAll.Checked) { $procs = $procs | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle } }
+        $procs | Sort-Object Name -Unique | ForEach-Object {
+            $desc = try { $_.MainModule.FileVersionInfo.FileDescription } catch { $null }
+            $display = if ($desc) { $desc } elseif ($_.MainWindowTitle) { $_.MainWindowTitle } else { $_.Name }
+            $item = New-Object System.Windows.Forms.ListViewItem($display)
+            [void]$item.SubItems.Add($_.Name)
+            [void]$item.SubItems.Add($_.MainWindowTitle)
+            $item.Tag = [pscustomobject]@{ Name = $_.Name; Label = $display }
+            [void]$procList.Items.Add($item)
+        }
+        $procList.EndUpdate()
+        $ok.Enabled = $false
+    }
+
+    $showAll.Add_CheckedChanged($fill)
+    $procList.Add_SelectedIndexChanged({ $ok.Enabled = $procList.SelectedItems.Count -gt 0 })
+    $procList.Add_DoubleClick({ if ($procList.SelectedItems.Count) { $dlg.DialogResult = 'OK'; $dlg.Close() } })
+    & $fill
+
+    if ($dlg.ShowDialog($form) -eq 'OK' -and $procList.SelectedItems.Count) {
+        $pick = $procList.SelectedItems[0].Tag
+        Add-Game $pick.Name $pick.Label
+    }
+    $dlg.Dispose()
+}
+
+# ---------- main window ----------
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'Game Idle Watcher'
+$form.Size = New-Object System.Drawing.Size(560, 420)
+$form.MinimumSize = New-Object System.Drawing.Size(480, 340)
+$form.StartPosition = 'CenterScreen'
+$form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$form.AutoScaleMode = 'Dpi'
+
+# Status (top)
+$statusPanel = New-Object System.Windows.Forms.Panel
+$statusPanel.Dock = 'Top'
+$statusPanel.Height = 56
+$statusPanel.Padding = New-Object System.Windows.Forms.Padding(10, 8, 10, 4)
+
+$watcherLabel = New-Object System.Windows.Forms.Label
+$watcherLabel.Dock = 'Top'
+$watcherLabel.Height = 22
+$watcherLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+
+$idleLabel = New-Object System.Windows.Forms.Label
+$idleLabel.Dock = 'Top'
+$idleLabel.Height = 22
+
+$statusPanel.Controls.AddRange(@($idleLabel, $watcherLabel))
+
+# Game list (fill)
+$list = New-Object System.Windows.Forms.ListView
+$list.View = 'Details'
+$list.FullRowSelect = $true
+$list.HideSelection = $false
+$list.Dock = 'Fill'
+[void]$list.Columns.Add('Game', 220)
+[void]$list.Columns.Add('Process name', 120)
+# Last column fills the remaining width (-2 = fill).
+$list.Add_Resize({ if ($list.Columns.Count -eq 2) { $list.Columns[1].Width = -2 } })
+
+# List buttons (right)
+$side = New-Object System.Windows.Forms.FlowLayoutPanel
+$side.Dock = 'Right'
+$side.Width = 170
+$side.FlowDirection = 'TopDown'
+$side.Padding = New-Object System.Windows.Forms.Padding(6, 0, 6, 0)
+
+function New-SideButton([string]$text) {
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $text
+    $b.Width = 150
+    $b.Height = 30
+    $b
+}
+$addRunningButton = New-SideButton 'Add running program...'
+$addNameButton    = New-SideButton 'Add by process name...'
+$removeButton     = New-SideButton 'Remove'
+$removeButton.Enabled = $false
+$side.Controls.AddRange(@($addRunningButton, $addNameButton, $removeButton))
+
+# Install buttons (bottom)
+$bottomPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+$bottomPanel.Dock = 'Bottom'
+$bottomPanel.Height = 48
+$bottomPanel.FlowDirection = 'RightToLeft'
+$bottomPanel.Padding = New-Object System.Windows.Forms.Padding(6, 8, 6, 6)
+
+$uninstallButton = New-Object System.Windows.Forms.Button
+$uninstallButton.Text = 'Uninstall'
+$uninstallButton.Width = 100
+$uninstallButton.Height = 30
+
+$installButton = New-Object System.Windows.Forms.Button
+$installButton.Width = 100
+$installButton.Height = 30
+
+$note = New-Object System.Windows.Forms.Label
+$note.Text = 'Changes apply within 5 seconds, no restart needed.'
+$note.AutoSize = $true
+$note.ForeColor = [System.Drawing.SystemColors]::GrayText
+$note.Margin = New-Object System.Windows.Forms.Padding(3, 8, 12, 3)
+
+$bottomPanel.Controls.AddRange(@($uninstallButton, $installButton, $note))
+
+# Fill control first so the docked panels are laid out around it.
+$form.Controls.AddRange(@($list, $side, $bottomPanel, $statusPanel))
+
+# ---------- events ----------
+
+$list.Add_SelectedIndexChanged({ $removeButton.Enabled = $list.SelectedItems.Count -gt 0 })
+
+$addRunningButton.Add_Click({ Show-ProcessPicker })
+
+$addNameButton.Add_Click({
+    $name = [Microsoft.VisualBasic.Interaction]::InputBox(
+        "Process name of the game (Task Manager > Details, e.g. Warframe.x64.exe):",
+        'Add by process name')
+    $name = Normalize-ProcessName $name
+    if (-not $name) { return }
+    $label = [Microsoft.VisualBasic.Interaction]::InputBox('Display name (optional):', 'Add by process name', $name)
+    Add-Game $name $label
+})
+
+$removeButton.Add_Click({
+    $remove = @($list.SelectedItems | ForEach-Object { $_.Tag.Name })
+    Save-Games @(Read-Games | Where-Object { $remove -notcontains $_.Name })
+    Refresh-List
+    Update-Status
+})
+
+$installButton.Add_Click({ Invoke-Bat 'Install-GameIdleWatcher.bat' })
+
+$uninstallButton.Add_Click({
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        'Remove the watcher and restore normal CPU idle behavior?', 'Game Idle Watcher', 'YesNo', 'Question')
+    if ($answer -eq 'Yes') { Invoke-Bat 'Uninstall-GameIdleWatcher.bat' }
+})
+
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 2000
+$timer.Add_Tick({ Update-Status })
+
+$form.Add_Shown({ Refresh-List; Update-Status; $timer.Start() })
+$form.Add_FormClosed({ $timer.Stop() })
+
+if (-not (Test-Path -LiteralPath $GamesFile)) { Save-Games @() }
+[void]$form.ShowDialog()
