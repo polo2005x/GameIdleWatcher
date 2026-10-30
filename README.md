@@ -18,12 +18,14 @@ If you move the folder, just open `GameIdleWatcher.bat` again and it repairs its
 
 ## Settings window
 
+- **Watcher enabled**: untick to pause everything (for example to compare with and without the fix). Your games and modes are kept; tick it again to resume.
 - **Status**: whether the watcher is running and which CPU idle setting is applied right now.
 - **Live check**: measures what the cores are actually doing (idle, light sleep C1, deep sleep C2+C3) and says whether it's WORKING, NOT WORKING, STUCK or inactive.
 - **Default mode**: the mode used for games that don't have their own (see below).
 - **Add running program...**: start the game, then pick it from the list of open programs.
 - **Add by process name...**: type the `.exe` name (Task Manager → Details).
 - **Remove** a game.
+- **Checkbox / Disable selected**: turn a single game off without removing it. Disabled games are greyed out and ignored.
 - **Mode for selected game**: Default, Full or Light per game.
 - **View log**: opens `log.txt`, which records when the watcher started, when games opened/closed, mode changes, and when the fix turned on/off.
 
@@ -40,14 +42,15 @@ The default mode starts as Full and is saved in `settings.txt`. Each game can ov
 
 ## Games list
 
-The list lives in `games.txt`, one game per line. You can edit it by hand too:
+The list lives in `games.txt`, one game per line. It's created from `games.default.txt` the first time you run the app, and it's yours: updating the app doesn't overwrite it. You can edit it by hand too:
 
 ```
 League of Legends  # League of Legends (in a match only)
 Warframe.x64 | light  # Warframe
+Cyberpunk2077 | off  # Cyberpunk 2077
 ```
 
-The first part is the process name (the `.exe` name without `.exe`), the optional `| full` or `| light` sets that game's mode, and the text after `#` is the display name. Included by default:
+The first part is the process name (the `.exe` name without `.exe`). Optional flags: `| full` or `| light` sets that game's mode, `| off` disables it. The text after `#` is the display name. Included by default:
 
 | Game | Process | When it kicks in |
 |---|---|---|
@@ -56,7 +59,7 @@ The first part is the process name (the `.exe` name without `.exe`), the optiona
 
 ## Uninstall
 
-Remove all games from the list. The watcher is removed (no logon task, nothing running) and CPU idle states go back to normal. Then you can delete the folder.
+To turn it off temporarily, untick **Watcher enabled**. To remove it completely, remove all games from the list. The watcher is removed (no logon task, nothing running) and CPU idle states go back to normal. Then you can delete the folder.
 
 ## How it works
 

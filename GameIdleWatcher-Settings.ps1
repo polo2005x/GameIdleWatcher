@@ -9,6 +9,7 @@ $Header = @(
     '# Games that disable CPU idle states while running.'
     '# One process name per line (the .exe name without ".exe"). Text after # is a label.'
     '# Optional per-game mode: "Name | full" or "Name | light". Without it the default mode is used.'
+    '# "Name | off" keeps a game in the list but ignores it.'
 )
 
 # ---------- games.txt ----------
@@ -17,20 +18,22 @@ function Read-Games {
     if (-not (Test-Path -LiteralPath $GamesFile)) { return @() }
     foreach ($line in Get-Content -LiteralPath $GamesFile) {
         $parts = $line -split '#', 2
-        $fields = $parts[0] -split '\|', 2
+        $fields = $parts[0] -split '\|'
         $name = $fields[0].Trim()
         if (-not $name) { continue }
-        $mode = if ($fields.Count -gt 1) { $fields[1].Trim().ToLower() } else { '' }
-        if ($mode -notin 'full', 'light') { $mode = 'default' }
+        $flags = @($fields | Select-Object -Skip 1 | ForEach-Object { $_.Trim().ToLower() })
+        $mode = if ($flags -contains 'full') { 'full' } elseif ($flags -contains 'light') { 'light' } else { 'default' }
         $label = if ($parts.Count -gt 1 -and $parts[1].Trim()) { $parts[1].Trim() } else { $name }
-        [pscustomobject]@{ Name = $name; Mode = $mode; Label = $label }
+        [pscustomobject]@{ Name = $name; Mode = $mode; Enabled = -not ($flags -contains 'off'); Label = $label }
     }
 }
 
 function Save-Games($games) {
     $lines = $Header + @($games | ForEach-Object {
-        if ($_.Mode -in 'full', 'light') { "$($_.Name) | $($_.Mode)  # $($_.Label)" }
-        else { "$($_.Name)  # $($_.Label)" }
+        $fields = @($_.Name)
+        if ($_.Mode -in 'full', 'light') { $fields += $_.Mode }
+        if (-not $_.Enabled) { $fields += 'off' }
+        "$($fields -join ' | ')  # $($_.Label)"
     })
     Set-Content -LiteralPath $GamesFile -Value $lines -Encoding UTF8
 }
@@ -71,28 +74,38 @@ $Modes = @(
     [pscustomobject]@{ Key = 'light'; Text = 'Light - shallow sleep only (less heat/power)' }
 )
 
-function Read-Mode {
+function Read-Setting([string]$key, [string]$fallback) {
     if (Test-Path -LiteralPath $SettingsFile) {
-        $line = Get-Content -LiteralPath $SettingsFile | Where-Object { $_ -match '^\s*mode\s*=' } | Select-Object -First 1
-        if ($line -match '=\s*light\s*$') { return 'light' }
+        $line = Get-Content -LiteralPath $SettingsFile | Where-Object { $_ -match "^\s*$key\s*=" } | Select-Object -First 1
+        if ($line) { return ($line -split '=', 2)[1].Trim().ToLower() }
     }
-    'full'
+    $fallback
 }
 
-function Save-Mode([string]$mode) {
+function Save-Setting([string]$key, [string]$value) {
     $lines = if (Test-Path -LiteralPath $SettingsFile) { @(Get-Content -LiteralPath $SettingsFile) } else { @() }
-    if ($lines -match '^\s*mode\s*=') { $lines = $lines -replace '^\s*mode\s*=.*$', "mode=$mode" }
-    else { $lines += "mode=$mode" }
+    if ($lines -match "^\s*$key\s*=") { $lines = $lines -replace "^\s*$key\s*=.*$", "$key=$value" }
+    else { $lines += "$key=$value" }
     Set-Content -LiteralPath $SettingsFile -Value $lines -Encoding UTF8
 }
+
+function Read-Mode { if ((Read-Setting 'mode' 'full') -eq 'light') { 'light' } else { 'full' } }
+function Save-Mode([string]$mode) { Save-Setting 'mode' $mode }
+
+# enabled=false pauses the watcher without touching the game list.
+function Read-Enabled { (Read-Setting 'enabled' 'true') -notin 'false', 'off', '0', 'no' }
 
 function Update-Status {
     Sync-Watcher
     $games = @(Read-Games)
     $task = Get-TaskInfo $TaskName
+    $globalOn = Read-Enabled
     if (-not $games) {
         $watcherLabel.Text = 'Watcher: off (add a game to turn it on)'
         $watcherLabel.ForeColor = [System.Drawing.SystemColors]::GrayText
+    } elseif (-not $globalOn) {
+        $watcherLabel.Text = 'Watcher: PAUSED (tick "Watcher enabled" to turn it back on)'
+        $watcherLabel.ForeColor = [System.Drawing.Color]::DarkOrange
     } elseif ($task -and $task.Running) {
         $watcherLabel.Text = 'Watcher: running (starts automatically at logon)'
         $watcherLabel.ForeColor = [System.Drawing.Color]::ForestGreen
@@ -102,8 +115,11 @@ function Update-Status {
     }
 
     $openNames = if ($games) { @(Get-Process -Name $games.Name -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique) } else { @() }
-    $openGames = @($games | Where-Object { $openNames -contains $_.Name })
+    # Games that are open but ignored (disabled, or everything paused) are reported separately.
+    $ignored   = @($games | Where-Object { $openNames -contains $_.Name -and (-not $globalOn -or -not $_.Enabled) })
+    $openGames = @($games | Where-Object { $openNames -contains $_.Name -and $globalOn -and $_.Enabled })
     $label = if ($openGames) { ($openGames.Label) -join ' + ' } else { $null }
+    $ignoredLabel = if ($ignored) { ($ignored.Label) -join ' + ' } else { $null }
     $expected = if ($openGames) { Get-ExpectedMode $openGames } else { $null }
 
     $applied = if ((Get-PowerValue IDLEDISABLE) -eq 1) { 'full' }
@@ -117,7 +133,7 @@ function Update-Status {
     }
     $idleLabel.ForeColor = if ($applied) { [System.Drawing.Color]::ForestGreen } else { [System.Drawing.SystemColors]::ControlText }
 
-    Update-LiveCheck $label $applied $expected
+    Update-LiveCheck $label $applied $expected $globalOn $ignoredLabel
 }
 
 # ---------- live check: measure what the cores are actually doing ----------
@@ -140,7 +156,7 @@ $script:LastLabel   = $null   # running games last tick (a game opening/closing 
 $script:ChangedAt   = $null   # when a mode was last changed in this window
 $Grace = [TimeSpan]::FromSeconds(8)   # watcher polls every 5 s
 
-function Update-LiveCheck($gameLabel, $applied, $expected) {
+function Update-LiveCheck($gameLabel, $applied, $expected, $globalOn = $true, $ignoredLabel = $null) {
     $now = Get-Date
     if ($gameLabel) { if (-not $script:GameSeenAt) { $script:GameSeenAt = $now }; $script:GameGoneAt = $null }
     else            { if ($script:GameSeenAt) { $script:GameGoneAt = $now }; $script:GameSeenAt = $null }
@@ -181,34 +197,61 @@ function Update-LiveCheck($gameLabel, $applied, $expected) {
         $checkLabel.Text = "Live check: NOT WORKING - $gameLabel is running but idle was not changed. Is the watcher running?"
         $checkLabel.ForeColor = $bad
     } elseif ($applied) {
-        $checkLabel.Text = 'Live check: STUCK - idle is still changed but no listed game is running. Reopen this window to repair.'
+        $checkLabel.Text = 'Live check: STUCK - idle is still changed but no enabled game is running. Reopen this window to repair.'
         $checkLabel.ForeColor = $bad
+    } elseif (-not $globalOn) {
+        $checkLabel.Text = 'Live check: paused - watcher turned off, CPU sleeping normally'
+        $checkLabel.ForeColor = $plain
+    } elseif ($ignoredLabel) {
+        $checkLabel.Text = "Live check: inactive - $ignoredLabel is running but disabled, CPU sleeping normally"
+        $checkLabel.ForeColor = $plain
     } else {
         $checkLabel.Text = 'Live check: inactive - no listed game running, CPU sleeping normally'
         $checkLabel.ForeColor = $plain
     }
 }
 
+function Set-ItemStyle($item) {
+    $item.ForeColor = if ($item.Tag.Enabled) { [System.Drawing.SystemColors]::WindowText } else { [System.Drawing.SystemColors]::GrayText }
+    $item.SubItems[2].Text = if ($item.Tag.Enabled) { Get-ModeText $item.Tag.Mode } else { "Off - $(Get-ModeText $item.Tag.Mode)" }
+}
+
 function Refresh-List([string[]]$select = @()) {
+    $script:SyncingChecks = $true
     $list.BeginUpdate()
     $list.Items.Clear()
     foreach ($g in Read-Games) {
         $item = New-Object System.Windows.Forms.ListViewItem($g.Label)
         [void]$item.SubItems.Add($g.Name)
-        [void]$item.SubItems.Add((Get-ModeText $g.Mode))
+        [void]$item.SubItems.Add('')
         $item.Tag = $g
+        $item.Checked = $g.Enabled
+        Set-ItemStyle $item
         [void]$list.Items.Add($item)
         if ($select -contains $g.Name) { $item.Selected = $true }
     }
     $list.EndUpdate()
     $list.Columns[2].Width = -2
+    $script:SyncingChecks = $false
     Update-Selection
+}
+
+# Turn the given games on or off (keeps them in the list).
+function Set-GamesEnabled([string[]]$names, [bool]$on) {
+    $games = @(Read-Games)
+    foreach ($g in $games) { if ($names -contains $g.Name) { $g.Enabled = $on } }
+    Save-Games $games
+    $script:ChangedAt = Get-Date
+    Refresh-List @($list.SelectedItems | ForEach-Object { $_.Tag.Name })
+    Update-Status
 }
 
 # Enable the per-game controls and show the selected game's mode.
 function Update-Selection {
     $any = $list.SelectedItems.Count -gt 0
     $removeButton.Enabled = $any
+    $toggleButton.Enabled = $any
+    $toggleButton.Text = if ($any -and @($list.SelectedItems | Where-Object { $_.Tag.Enabled }).Count -eq 0) { 'Enable selected' } else { 'Disable selected' }
     $gameModeBox.Enabled = $any
     $script:SyncingMode = $true
     if ($any) {
@@ -407,7 +450,7 @@ function Show-ProcessPicker {
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Game Idle Watcher'
-$form.Size = New-Object System.Drawing.Size(600, 500)
+$form.Size = New-Object System.Drawing.Size(620, 560)
 $form.MinimumSize = New-Object System.Drawing.Size(480, 340)
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
@@ -445,6 +488,12 @@ $modeBox.DisplayMember = 'Text'
 foreach ($m in $Modes) { [void]$modeBox.Items.Add($m) }
 
 $modeRow.Controls.AddRange(@($modeLabel, $modeBox))
+
+$enabledBox = New-Object System.Windows.Forms.CheckBox
+$enabledBox.Text = 'Watcher enabled  (untick to pause everything without losing your settings)'
+$enabledBox.Dock = 'Top'
+$enabledBox.Height = 26
+$enabledBox.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 $checkLabel = New-Object System.Windows.Forms.Label
 $checkLabel.Dock = 'Top'
 $checkLabel.Height = 22
@@ -456,9 +505,9 @@ $numbersLabel.Dock = 'Top'
 $numbersLabel.Height = 22
 $numbersLabel.ForeColor = [System.Drawing.SystemColors]::GrayText
 
-$statusPanel.Height = 136
-# Docked Top in reverse: watcher, idle setting, live check, numbers, then mode row.
-$statusPanel.Controls.AddRange(@($modeRow, $numbersLabel, $checkLabel, $idleLabel, $watcherLabel))
+$statusPanel.Height = 164
+# Docked Top in reverse: on/off switch, watcher, idle setting, live check, numbers, then mode row.
+$statusPanel.Controls.AddRange(@($modeRow, $numbersLabel, $checkLabel, $idleLabel, $watcherLabel, $enabledBox))
 
 # Game list (fill)
 $list = New-Object System.Windows.Forms.ListView
@@ -466,6 +515,8 @@ $list.View = 'Details'
 $list.FullRowSelect = $true
 $list.HideSelection = $false
 $list.Dock = 'Fill'
+$list.CheckBoxes = $true   # tick = game enabled
+$script:SyncingChecks = $false
 [void]$list.Columns.Add('Game', 190)
 [void]$list.Columns.Add('Process name', 120)
 [void]$list.Columns.Add('Mode', 90)
@@ -490,6 +541,8 @@ $addRunningButton = New-SideButton 'Add running program...'
 $addNameButton    = New-SideButton 'Add by process name...'
 $removeButton     = New-SideButton 'Remove'
 $removeButton.Enabled = $false
+$toggleButton     = New-SideButton 'Disable selected'
+$toggleButton.Enabled = $false
 
 $gameModeLabel = New-Object System.Windows.Forms.Label
 $gameModeLabel.Text = 'Mode for selected game:'
@@ -511,7 +564,7 @@ $script:SyncingMode = $false
 
 $viewLogButton    = New-SideButton 'View log'
 $viewLogButton.Margin = New-Object System.Windows.Forms.Padding(3, 24, 3, 3)
-$side.Controls.AddRange(@($addRunningButton, $addNameButton, $removeButton, $gameModeLabel, $gameModeBox, $viewLogButton))
+$side.Controls.AddRange(@($addRunningButton, $addNameButton, $removeButton, $toggleButton, $gameModeLabel, $gameModeBox, $viewLogButton))
 
 # Install buttons (bottom)
 $bottomPanel = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -534,6 +587,34 @@ $form.Controls.AddRange(@($list, $side, $bottomPanel, $statusPanel))
 # ---------- events ----------
 
 $list.Add_SelectedIndexChanged({ Update-Selection })
+
+# Ticking/unticking a game's checkbox enables/disables it.
+$list.Add_ItemChecked({
+    param($s, $e)
+    if ($script:SyncingChecks) { return }
+    $item = $e.Item
+    if ($item.Tag.Enabled -eq $item.Checked) { return }
+    $item.Tag.Enabled = $item.Checked
+    $games = @(Read-Games)
+    foreach ($g in $games) { if ($g.Name -eq $item.Tag.Name) { $g.Enabled = $item.Checked } }
+    Save-Games $games
+    $script:ChangedAt = Get-Date
+    Set-ItemStyle $item
+    Update-Selection
+})
+
+$toggleButton.Add_Click({
+    $names = @($list.SelectedItems | ForEach-Object { $_.Tag.Name })
+    $turnOn = @($list.SelectedItems | Where-Object { $_.Tag.Enabled }).Count -eq 0
+    Set-GamesEnabled $names $turnOn
+})
+
+$enabledBox.Checked = Read-Enabled
+$enabledBox.Add_CheckedChanged({
+    Save-Setting 'enabled' $(if ($enabledBox.Checked) { 'true' } else { 'false' })
+    $script:ChangedAt = Get-Date
+    Update-Status
+})
 
 $gameModeBox.Add_SelectedIndexChanged({
     if ($script:SyncingMode -or -not $gameModeBox.SelectedItem -or $list.SelectedItems.Count -eq 0) { return }
@@ -588,5 +669,10 @@ $timer.Add_Tick({ Update-Status })
 $form.Add_Shown({ Refresh-List; Update-Status; $timer.Start() })
 $form.Add_FormClosed({ $timer.Stop() })
 
-if (-not (Test-Path -LiteralPath $GamesFile)) { Save-Games @() }
+# First run: start from the shipped list. games.txt is the user's own copy.
+$DefaultGamesFile = Join-Path $PSScriptRoot 'games.default.txt'
+if (-not (Test-Path -LiteralPath $GamesFile)) {
+    if (Test-Path -LiteralPath $DefaultGamesFile) { Copy-Item -LiteralPath $DefaultGamesFile -Destination $GamesFile }
+    else { Save-Games @() }
+}
 [void]$form.ShowDialog()

@@ -2,3 +2,6 @@
 settings.txt
 # Watcher activity log.
 log.txt
+
+# Your game list (created from games.default.txt on first run).
+games.txt

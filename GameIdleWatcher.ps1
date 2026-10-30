@@ -9,11 +9,18 @@
 #           go into the deeper, slower-to-wake states. Less heat and power than full.
 # Each game in games.txt can set its own mode ("Name | light"); games without one use the default
 # from settings.txt (mode=full or mode=light). If several games run at once, full wins over light.
+# "Name | off" disables one game; enabled=false in settings.txt pauses the whole watcher.
 
 $GamesFile    = Join-Path $PSScriptRoot 'games.txt'
 $SettingsFile = Join-Path $PSScriptRoot 'settings.txt'
 $LogFile      = Join-Path $PSScriptRoot 'log.txt'
 $PollSeconds  = 5
+
+# First run: start from the shipped list. games.txt is the user's own copy.
+$DefaultGamesFile = Join-Path $PSScriptRoot 'games.default.txt'
+if (-not (Test-Path -LiteralPath $GamesFile) -and (Test-Path -LiteralPath $DefaultGamesFile)) {
+    Copy-Item -LiteralPath $DefaultGamesFile -Destination $GamesFile
+}
 
 function Write-Log([string]$message) {
     try {
@@ -26,27 +33,33 @@ function Write-Log([string]$message) {
     } catch { }
 }
 
-# One game per line: "ProcessName", optionally "ProcessName | full" or "ProcessName | light".
-# The process name is the .exe name without ".exe"; anything after # is a label/comment.
+# One game per line: "ProcessName", optionally followed by "| full" or "| light" (mode) and/or
+# "| off" (disabled, kept in the list but ignored). The process name is the .exe name without ".exe";
+# anything after # is a label/comment.
 function Get-Games {
     if (-not (Test-Path -LiteralPath $GamesFile)) { return @() }
     foreach ($line in Get-Content -LiteralPath $GamesFile) {
-        $fields = ($line -split '#', 2)[0] -split '\|', 2
+        $fields = ($line -split '#', 2)[0] -split '\|'
         $name = $fields[0].Trim()
         if (-not $name) { continue }
-        $mode = if ($fields.Count -gt 1) { $fields[1].Trim().ToLower() } else { '' }
-        if ($mode -notin 'full', 'light') { $mode = 'default' }
-        [pscustomobject]@{ Name = $name; Mode = $mode }
+        $flags = @($fields | Select-Object -Skip 1 | ForEach-Object { $_.Trim().ToLower() })
+        $mode = if ($flags -contains 'full') { 'full' } elseif ($flags -contains 'light') { 'light' } else { 'default' }
+        [pscustomobject]@{ Name = $name; Mode = $mode; Enabled = -not ($flags -contains 'off') }
     }
 }
 
-function Get-Mode {
+function Get-Setting([string]$key, [string]$fallback) {
     if (Test-Path -LiteralPath $SettingsFile) {
-        $line = Get-Content -LiteralPath $SettingsFile | Where-Object { $_ -match '^\s*mode\s*=' } | Select-Object -First 1
-        if ($line -match '=\s*light\s*$') { return 'light' }
+        $line = Get-Content -LiteralPath $SettingsFile | Where-Object { $_ -match "^\s*$key\s*=" } | Select-Object -First 1
+        if ($line) { return ($line -split '=', 2)[1].Trim().ToLower() }
     }
-    'full'
+    $fallback
 }
+
+function Get-Mode { if ((Get-Setting 'mode' 'full') -eq 'light') { 'light' } else { 'full' } }
+
+# enabled=false in settings.txt pauses everything without touching the game list.
+function Get-Enabled { (Get-Setting 'enabled' 'true') -notin 'false', 'off', '0', 'no' }
 
 function Get-PowerValue([string]$setting) {
     # Last two hex values in the output are the AC and DC indices (works on any Windows language).
@@ -82,13 +95,24 @@ Restore-Idle
 $activeMode = $null   # $null = not active, otherwise the mode currently applied
 $prevRunning = @()
 $prevDefault = $null
-$startGames = @(Get-Games) | ForEach-Object { if ($_.Mode -eq 'default') { $_.Name } else { "$($_.Name) ($($_.Mode))" } }
-Write-Log ("Watcher started. Default mode: {0}. Games: {1}. Normal thresholds: promote {2} / demote {3}." -f
-    (Get-Mode), ($startGames -join ', '), $script:OrigPromote, $script:OrigDemote)
+$prevEnabled = $null
+$startGames = @(Get-Games) | ForEach-Object {
+    $flags = @($(if ($_.Mode -ne 'default') { $_.Mode }), $(if (-not $_.Enabled) { 'off' })) | Where-Object { $_ }
+    if ($flags) { "$($_.Name) ($($flags -join ', '))" } else { $_.Name }
+}
+Write-Log ("Watcher started. {0}Default mode: {1}. Games: {2}. Normal thresholds: promote {3} / demote {4}." -f
+    $(if (Get-Enabled) { '' } else { 'PAUSED. ' }), (Get-Mode), ($startGames -join ', '), $script:OrigPromote, $script:OrigDemote)
 
 try {
     while ($true) {
-        $games = @(Get-Games)
+        $enabled = Get-Enabled
+        if ($null -ne $prevEnabled -and $enabled -ne $prevEnabled) {
+            Write-Log $(if ($enabled) { 'Resumed: watcher turned back on' } else { 'Paused: watcher turned off in settings' })
+        }
+        $prevEnabled = $enabled
+
+        # Only enabled games count, and none while the watcher is paused.
+        $games = if ($enabled) { @(Get-Games | Where-Object Enabled) } else { @() }
         $defaultMode = Get-Mode
         # Match by name only: Vanguard hides League's path from normal processes.
         $runningNames = if ($games) { @(Get-Process -Name $games.Name -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique | Sort-Object) } else { @() }
@@ -116,7 +140,7 @@ try {
         } elseif (-not $running -and $activeMode) {
             Restore-Idle
             $activeMode = $null
-            Write-Log 'OFF: no listed game running, normal CPU idle restored'
+            Write-Log $(if ($enabled) { 'OFF: no enabled game running, normal CPU idle restored' } else { 'OFF: paused, normal CPU idle restored' })
         }
 
         Start-Sleep -Seconds $PollSeconds
