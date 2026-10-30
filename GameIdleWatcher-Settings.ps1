@@ -83,16 +83,81 @@ function Update-Status {
 
     $games = @(Read-Games)
     $open = if ($games) { Get-Process -Name $games.Name -ErrorAction SilentlyContinue | Select-Object -First 1 }
-    $label = if ($open) { ($games | Where-Object Name -eq $open.Name | Select-Object -First 1).Label } else { 'a game' }
-    if ((Get-PowerValue IDLEDISABLE) -eq 1) {
-        $idleLabel.Text = "CPU idle: DISABLED - full mode ($label is running)"
-        $idleLabel.ForeColor = [System.Drawing.Color]::ForestGreen
-    } elseif ((Get-PowerValue IDLEPROMOTE) -eq 100 -and (Get-PowerValue IDLEDEMOTE) -eq 100) {
-        $idleLabel.Text = "CPU idle: SHALLOW ONLY - light mode ($label is running)"
-        $idleLabel.ForeColor = [System.Drawing.Color]::ForestGreen
+    $label = if ($open) { ($games | Where-Object Name -eq $open.Name | Select-Object -First 1).Label } else { $null }
+
+    $applied = if ((Get-PowerValue IDLEDISABLE) -eq 1) { 'full' }
+               elseif ((Get-PowerValue IDLEPROMOTE) -eq 100 -and (Get-PowerValue IDLEDEMOTE) -eq 100) { 'light' }
+               else { $null }
+
+    switch ($applied) {
+        'full'  { $idleLabel.Text = 'CPU idle setting: DISABLED (full mode)' }
+        'light' { $idleLabel.Text = 'CPU idle setting: SHALLOW ONLY (light mode)' }
+        default { $idleLabel.Text = 'CPU idle setting: normal' }
+    }
+    $idleLabel.ForeColor = if ($applied) { [System.Drawing.Color]::ForestGreen } else { [System.Drawing.SystemColors]::ControlText }
+
+    Update-LiveCheck $label $applied
+}
+
+# ---------- live check: measure what the cores are actually doing ----------
+
+# Same counters as Performance Monitor (Processor > % C1/C2/C3/Idle Time). The first read is
+# always 0, so values are meaningful from the second timer tick on.
+$script:Counters = $null
+try {
+    $script:Counters = @{}
+    foreach ($c in '% Idle Time', '% C1 Time', '% C2 Time', '% C3 Time') {
+        $pc = New-Object System.Diagnostics.PerformanceCounter('Processor', $c, '_Total', $true)
+        [void]$pc.NextValue()
+        $script:Counters[$c] = $pc
+    }
+} catch { $script:Counters = $null }
+
+$script:GameSeenAt  = $null   # when a listed game was first seen running
+$script:GameGoneAt  = $null   # when the last listed game was seen closing
+$Grace = [TimeSpan]::FromSeconds(8)   # watcher polls every 5 s
+
+function Update-LiveCheck($gameLabel, $applied) {
+    $now = Get-Date
+    if ($gameLabel) { if (-not $script:GameSeenAt) { $script:GameSeenAt = $now }; $script:GameGoneAt = $null }
+    else            { if ($script:GameSeenAt) { $script:GameGoneAt = $now }; $script:GameSeenAt = $null }
+
+    if (-not $script:Counters) {
+        $checkLabel.Text = 'Live check: unavailable (CPU counters could not be read)'
+        $checkLabel.ForeColor = [System.Drawing.SystemColors]::GrayText
+        $numbersLabel.Text = ''
+        return
+    }
+
+    $idle = $script:Counters['% Idle Time'].NextValue()
+    $c1   = $script:Counters['% C1 Time'].NextValue()
+    $deep = $script:Counters['% C2 Time'].NextValue() + $script:Counters['% C3 Time'].NextValue()
+    $numbersLabel.Text = 'Measured now:  idle {0:N0}%   light sleep (C1) {1:N0}%   deep sleep (C2+C3) {2:N0}%' -f $idle, $c1, $deep
+
+    $ok    = [System.Drawing.Color]::ForestGreen
+    $bad   = [System.Drawing.Color]::Firebrick
+    $plain = [System.Drawing.SystemColors]::ControlText
+    $settling = ($script:GameSeenAt -and ($now - $script:GameSeenAt) -lt $Grace) -or
+                ($script:GameGoneAt -and ($now - $script:GameGoneAt) -lt $Grace)
+
+    if ($gameLabel -and $applied -eq 'full') {
+        if ($idle -lt 2) { $checkLabel.Text = "Live check: WORKING - $gameLabel running, cores never sleep"; $checkLabel.ForeColor = $ok }
+        else             { $checkLabel.Text = "Live check: NOT WORKING - idle is disabled but cores still idle $([math]::Round($idle))%"; $checkLabel.ForeColor = $bad }
+    } elseif ($gameLabel -and $applied -eq 'light') {
+        if ($deep -lt 2) { $checkLabel.Text = "Live check: WORKING - $gameLabel running, no deep sleep"; $checkLabel.ForeColor = $ok }
+        else             { $checkLabel.Text = "Live check: NOT WORKING - light mode on but deep sleep is $([math]::Round($deep))% (try Full)"; $checkLabel.ForeColor = $bad }
+    } elseif ($settling) {
+        $checkLabel.Text = 'Live check: switching... (watcher checks every 5 seconds)'
+        $checkLabel.ForeColor = $plain
+    } elseif ($gameLabel) {
+        $checkLabel.Text = "Live check: NOT WORKING - $gameLabel is running but idle was not changed. Is the watcher running?"
+        $checkLabel.ForeColor = $bad
+    } elseif ($applied) {
+        $checkLabel.Text = 'Live check: STUCK - idle is still changed but no listed game is running. Click Reinstall.'
+        $checkLabel.ForeColor = $bad
     } else {
-        $idleLabel.Text = 'CPU idle: normal (no listed game running)'
-        $idleLabel.ForeColor = [System.Drawing.SystemColors]::ControlText
+        $checkLabel.Text = 'Live check: inactive - no listed game running, CPU sleeping normally'
+        $checkLabel.ForeColor = $plain
     }
 }
 
@@ -227,7 +292,7 @@ function Show-ProcessPicker {
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Game Idle Watcher'
-$form.Size = New-Object System.Drawing.Size(560, 450)
+$form.Size = New-Object System.Drawing.Size(600, 500)
 $form.MinimumSize = New-Object System.Drawing.Size(480, 340)
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
@@ -265,9 +330,20 @@ $modeBox.DisplayMember = 'Text'
 foreach ($m in $Modes) { [void]$modeBox.Items.Add($m) }
 
 $modeRow.Controls.AddRange(@($modeLabel, $modeBox))
-$statusPanel.Height = 90
-# Docked Top in reverse: watcher line, idle line, then mode row.
-$statusPanel.Controls.AddRange(@($modeRow, $idleLabel, $watcherLabel))
+$checkLabel = New-Object System.Windows.Forms.Label
+$checkLabel.Dock = 'Top'
+$checkLabel.Height = 22
+$checkLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+$checkLabel.Text = 'Live check: measuring...'
+
+$numbersLabel = New-Object System.Windows.Forms.Label
+$numbersLabel.Dock = 'Top'
+$numbersLabel.Height = 22
+$numbersLabel.ForeColor = [System.Drawing.SystemColors]::GrayText
+
+$statusPanel.Height = 136
+# Docked Top in reverse: watcher, idle setting, live check, numbers, then mode row.
+$statusPanel.Controls.AddRange(@($modeRow, $numbersLabel, $checkLabel, $idleLabel, $watcherLabel))
 
 # Game list (fill)
 $list = New-Object System.Windows.Forms.ListView
@@ -298,7 +374,9 @@ $addRunningButton = New-SideButton 'Add running program...'
 $addNameButton    = New-SideButton 'Add by process name...'
 $removeButton     = New-SideButton 'Remove'
 $removeButton.Enabled = $false
-$side.Controls.AddRange(@($addRunningButton, $addNameButton, $removeButton))
+$viewLogButton    = New-SideButton 'View log'
+$viewLogButton.Margin = New-Object System.Windows.Forms.Padding(3, 24, 3, 3)
+$side.Controls.AddRange(@($addRunningButton, $addNameButton, $removeButton, $viewLogButton))
 
 # Install buttons (bottom)
 $bottomPanel = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -354,6 +432,12 @@ $removeButton.Add_Click({
     Save-Games @(Read-Games | Where-Object { $remove -notcontains $_.Name })
     Refresh-List
     Update-Status
+})
+
+$viewLogButton.Add_Click({
+    $log = Join-Path $PSScriptRoot 'log.txt'
+    if (Test-Path -LiteralPath $log) { Start-Process notepad.exe -ArgumentList "`"$log`"" }
+    else { [System.Windows.Forms.MessageBox]::Show('No log yet. The watcher creates log.txt when it starts.', 'Game Idle Watcher') | Out-Null }
 })
 
 $installButton.Add_Click({ Invoke-Bat 'Install-GameIdleWatcher.bat' })

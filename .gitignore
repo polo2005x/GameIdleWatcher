@@ -1,2 +1,4 @@
 # Per-user choice made in the settings window (defaults to full mode when missing).
 settings.txt
+# Watcher activity log.
+log.txt

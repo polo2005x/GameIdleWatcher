@@ -18,6 +18,8 @@ It runs hidden in the background and starts automatically at every logon. If you
 Open `GameIdleWatcher-Settings.bat` to:
 
 - See whether the watcher is running and whether CPU idle is currently disabled.
+- **Live check**: measures what the cores are actually doing (idle, light sleep C1, deep sleep C2+C3) and says whether it's WORKING, NOT WORKING, STUCK or inactive.
+- **View log**: opens `log.txt`, which records when the watcher started, when games opened/closed, mode changes, and when the fix turned on/off.
 - Pick the **mode** used while a game runs (see below).
 - **Add running program...**: start the game, then pick it from the list of open programs.
 - **Add by process name...**: type the `.exe` name (Task Manager → Details).

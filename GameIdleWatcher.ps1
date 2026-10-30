@@ -10,7 +10,19 @@
 
 $GamesFile    = Join-Path $PSScriptRoot 'games.txt'
 $SettingsFile = Join-Path $PSScriptRoot 'settings.txt'
+$LogFile      = Join-Path $PSScriptRoot 'log.txt'
 $PollSeconds  = 5
+
+function Write-Log([string]$message) {
+    try {
+        Add-Content -LiteralPath $LogFile -Value ("{0:yyyy-MM-dd HH:mm:ss}  {1}" -f (Get-Date), $message)
+        # Keep the log small: once it passes ~256 KB, keep the newest 1000 lines.
+        if ((Get-Item -LiteralPath $LogFile).Length -gt 256KB) {
+            $keep = Get-Content -LiteralPath $LogFile -Tail 1000
+            Set-Content -LiteralPath $LogFile -Value $keep
+        }
+    } catch { }
+}
 
 # One process name per line (the .exe name without ".exe"); anything after # is a label/comment.
 function Get-GameNames {
@@ -60,25 +72,40 @@ if ($script:OrigPromote -eq 100 -and $script:OrigDemote -eq 100) {
 # Start from a known-good state in case a previous run was killed mid-game.
 Restore-Idle
 $activeMode = $null   # $null = not active, otherwise the mode currently applied
+$prevRunning = @()
+$prevMode = $null
+Write-Log ("Watcher started. Mode: {0}. Games: {1}. Normal thresholds: promote {2} / demote {3}." -f
+    (Get-Mode), ((@(Get-GameNames)) -join ', '), $script:OrigPromote, $script:OrigDemote)
 
 try {
     while ($true) {
         $names = @(Get-GameNames)
         # Match by name only: Vanguard hides League's path from normal processes.
-        $running = $names.Count -gt 0 -and [bool](Get-Process -Name $names -ErrorAction SilentlyContinue)
+        $runningNames = if ($names) { @(Get-Process -Name $names -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique | Sort-Object) } else { @() }
+        $running = $runningNames.Count -gt 0
         $mode = Get-Mode
+
+        if ($prevMode -and $mode -ne $prevMode) { Write-Log "Mode changed: $prevMode -> $mode" }
+        $prevMode = $mode
+        foreach ($n in $runningNames) { if ($prevRunning -notcontains $n) { Write-Log "Game started: $n" } }
+        foreach ($n in $prevRunning)  { if ($runningNames -notcontains $n) { Write-Log "Game closed: $n" } }
+        $prevRunning = $runningNames
 
         if ($running -and $activeMode -ne $mode) {
             if ($activeMode) { Restore-Idle }   # mode switched while a game is running
             Enable-Mode $mode
             $activeMode = $mode
+            Write-Log ("ON ({0} mode): {1}" -f $mode,
+                $(if ($mode -eq 'light') { 'promote/demote thresholds set to 100%' } else { 'processor idle disabled' }))
         } elseif (-not $running -and $activeMode) {
             Restore-Idle
             $activeMode = $null
+            Write-Log 'OFF: no listed game running, normal CPU idle restored'
         }
 
         Start-Sleep -Seconds $PollSeconds
     }
 } finally {
     Restore-Idle
+    Write-Log 'Watcher stopped, normal CPU idle restored'
 }
